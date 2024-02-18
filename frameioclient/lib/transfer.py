@@ -64,15 +64,6 @@ class FrameioDownloader(object):
         self._evaluate_asset()
         self._get_path()
 
-    def get_path(self):
-        if self.prefix != None:
-            self.filename = self.prefix + self.filename
-
-        if self.destination == None:
-            final_destination = os.path.join(self.download_folder, self.filename)
-            self.destination = final_destination
-
-        return self.destination
 
     def _evaluate_asset(self):
         if self.asset.get("_type") != "file":
@@ -89,21 +80,7 @@ class FrameioDownloader(object):
         except (TypeError, KeyError):
             self.original_checksum = None
 
-    def _create_file_stub(self):
-        try:
-            fp = open(self.destination, "w")
-            # fp.write(b"\0" * self.filesize) # Disabled to prevent pre-allocatation of disk space
-            fp.close()
-        except FileExistsError as e:
-            if self.replace == True:
-                os.remove(self.destination)  # Remove the file
-                self._create_file_stub()  # Create a new stub
-            else:
-                raise e
-        return True
-
     def _get_path(self):
-        logger.info("prefix: {}".format(self.prefix))
         if self.prefix != None:
             self.filename = self.prefix + self.filename
 
@@ -151,8 +128,11 @@ class FrameioDownloader(object):
 
         return url
 
-    def download(self):
-        """Call this to perform the actual download of your asset!"""
+    def download(self, stats=False):
+        """Call this to perform the actual download of your asset!
+
+        - stats: True to return a dict with stats about the download.
+                 When `multi_part`=True, such stats always returned."""
 
         # Check folders
         if os.path.isdir(os.path.join(os.path.curdir, self.download_folder)):
@@ -162,15 +142,32 @@ class FrameioDownloader(object):
             os.mkdir(self.download_folder)
 
         # Check files
-        if os.path.isfile(self.get_path()) == False:
+        filepath = self._get_path()
+        if not os.path.isfile(filepath):
             pass
 
-        if os.path.isfile(self.get_path()) and self.replace == True:
-            os.remove(self.get_path())
+        if os.path.isfile(filepath) and self.replace:
+            logger.info("File already exists at this location. replace=True so let's delete it on disk and redownload.`")
+            os.remove(filepath)
 
-        if os.path.isfile(self.get_path()) and self.replace == False:
-            logger.info("File already exists at this location.")
-            return self.destination
+        if os.path.isfile(filepath) and not self.replace:
+            if self.checksum_verification:
+                # Unimplemented
+                # Do a checksum verification against disk file and determine if file is faulty and requires redownload
+                pass
+            filesize_on_disk = os.path.getsize(filepath)
+            if self.filesize == filesize_on_disk:
+                logger.info("File already exists at this location with same filesize. Skipping download.")
+                if stats:
+                    return {
+                        "outcome": "file_exists_already_on_disk",
+                        "destination": self.destination,
+                    }
+                else:
+                    return self.destination
+            else:
+                logger.info(f"""File already exists at this location on disk, and filesize is different to the asset size on Frame.IO. Will redownload (overwrite).
+                    (asset size: {self.filesize}, size on disk: {filesize_on_disk})""")
 
         # Get URL
         url = self.get_download_key()
@@ -185,11 +182,11 @@ class FrameioDownloader(object):
         else:
             # Don't use multi-part download for files below 25 MB
             if self.asset["filesize"] < 26214400:
-                return self.aws_client._download_whole(url)
+                return self.aws_client._download_whole(url, stats)
             if self.multi_part == True:
-                return self.aws_client.multi_thread_download(url)
+                return self.aws_client.multi_thread_download()
             else:
-                return self.aws_client._download_whole(url)
+                return self.aws_client._download_whole(url, stats)
 
 
 class AWSClient(HTTPClient, object):
@@ -226,7 +223,8 @@ class AWSClient(HTTPClient, object):
             # fp.write(b"\0" * self.filesize) # Disabled to prevent pre-allocatation of disk space
             fp.close()
         except FileExistsError as e:
-            if self.replace == True:
+            if self.downloader.replace == True:
+                logger.info(f"Creating file stub at below path and Downloader has replace=True. Deleting the file and creating new stub.\n  {self.downloader.destination}")
                 os.remove(self.downloader.destination)  # Remove the file
                 self._create_file_stub()  # Create a new stub
             else:
@@ -279,11 +277,11 @@ class AWSClient(HTTPClient, object):
         br = requests.get(url, headers=headers).content
         return br
 
-    def _download_whole(self, url: str):
+    def _download_whole(self, url: str, stats: bool=False):
         start_time = time.time()
         print(
             "Beginning download -- {} -- {}".format(
-                self.asset["name"],
+                self.downloader.filename,
                 Utils.format_value(self.downloader.filesize, type=FormatTypes.SIZE),
             )
         )
@@ -307,10 +305,23 @@ class AWSClient(HTTPClient, object):
             math.ceil(self.downloader.filesize / (download_time))
         )
         print(
-            f"Downloaded {Utils.format_value(self.downloader.filesize, type=FormatTypes.SIZE)} at {Utils.format_value(download_speed, type=FormatTypes.SPEED)}"
+            f"Downloaded {Utils.format_value(self.downloader.filesize, type=FormatTypes.SIZE)} at {download_speed}"
         )
 
-        return self.destination, download_speed
+        dl_info = {
+            "outcome": "success",
+            "destination": self.destination,
+            "speed": download_speed,
+            "elapsed": download_time,
+            "cdn": AWSClient.check_cdn(self.original),
+            "concurrency": self.concurrency,
+            "size": self.downloader.filesize,
+            "chunks": 0,
+        }
+        if stats:
+            return dl_info
+        else:
+            return self.destination, download_speed
 
     def _download_chunk(self, task: List):
         # Download a particular chunk
@@ -377,8 +388,6 @@ class AWSClient(HTTPClient, object):
         except Exception as e:
             raise DownloadException(message=e)
 
-        pprint(self.downloader)
-
         offset = math.ceil(self.downloader.filesize / self.downloader.chunks)
         in_byte = 0  # Set initially here, but then override
 
@@ -416,7 +425,6 @@ class AWSClient(HTTPClient, object):
 
         # Calculate and print stats
         download_time = round((time.time() - start_time), 2)
-        pprint(self.downloader)
         download_speed = round((self.downloader.filesize / download_time), 2)
 
         if self.downloader.checksum_verification == True:
@@ -449,6 +457,7 @@ class AWSClient(HTTPClient, object):
         if self.downloader.stats:
             # We end by returning a dict with info about the download
             dl_info = {
+                "outcome": "success",
                 "destination": self.destination,
                 "speed": download_speed,
                 "elapsed": download_time,
