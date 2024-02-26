@@ -2,9 +2,10 @@ import concurrent.futures
 import math
 import os
 import time
+from datetime import datetime, timedelta
 from pprint import pprint
 from random import randint
-from typing import Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 import requests
 
@@ -128,17 +129,15 @@ class FrameioDownloader(object):
 
         return url
 
-    def download(self, stats=False):
+    def download(self, stats=False, progress_callback: Callable[[str], Any]=None):
         """Call this to perform the actual download of your asset!
 
         - stats: True to return a dict with stats about the download.
                  When `multi_part`=True, such stats always returned."""
 
         # Check folders
-        if os.path.isdir(os.path.join(os.path.curdir, self.download_folder)):
-            logger.info("Folder exists, don't need to create it")
-        else:
-            logger.info("Destination folder not found, creating")
+        if not os.path.isdir(os.path.join(os.path.curdir, self.download_folder)):
+            logger.debug("Destination folder not found, creating")
             os.mkdir(self.download_folder)
 
         # Check files
@@ -147,7 +146,7 @@ class FrameioDownloader(object):
             pass
 
         if os.path.isfile(filepath) and self.replace:
-            logger.info("File already exists at this location. replace=True so let's delete it on disk and redownload.`")
+            logger.info("File already exists at this location. replace=True so it will be deleted on disk and redownloaded.")
             os.remove(filepath)
 
         if os.path.isfile(filepath) and not self.replace:
@@ -173,7 +172,7 @@ class FrameioDownloader(object):
         url = self.get_download_key()
 
         # AWS Client
-        self.aws_client = AWSClient(downloader=self, concurrency=5)
+        self.aws_client = AWSClient(downloader=self, concurrency=5, progress_callback=progress_callback)
 
         # Handle watermarking
         if self.watermarked == True:
@@ -184,15 +183,16 @@ class FrameioDownloader(object):
             if self.asset["filesize"] < 26214400:
                 return self.aws_client._download_whole(url, stats)
             if self.multi_part == True:
-                return self.aws_client.multi_thread_download()
+                return self.aws_client._multi_thread_download()
             else:
                 return self.aws_client._download_whole(url, stats)
 
 
 class AWSClient(HTTPClient, object):
-    def __init__(self, downloader: FrameioDownloader, concurrency=None, progress=True):
+    def __init__(self, downloader: FrameioDownloader, concurrency=None, progress_callback=None):
         super().__init__(self)  # Initialize via inheritance
-        self.progress = progress
+        self.progress_callback = progress_callback
+        self.progress_interval_sec = 5
         self.progress_manager = None
         self.destination = downloader.destination
         self.bytes_started = 0
@@ -278,48 +278,70 @@ class AWSClient(HTTPClient, object):
         return br
 
     def _download_whole(self, url: str, stats: bool=False):
-        start_time = time.time()
-        print(
+        logger.info(
             "Beginning download -- {} -- {}".format(
                 self.downloader.filename,
                 Utils.format_value(self.downloader.filesize, type=FormatTypes.SIZE),
             )
         )
-
-        # Downloading
+        start_time = time.time()
         self.session = self._get_session()
         r = self.session.get(url, stream=True)
-
-        # Downloading
+        chunk_size = 4096
+        bytes_downloaded = 0
         with open(self.downloader.destination, "wb") as handle:
+            time_updated_last = datetime.now()
+            time_update = time_updated_last + timedelta(seconds=self.progress_interval_sec)
+            progress_values = {
+                'download_type': 'whole',
+                'start_time': start_time,
+                'end_time': None,
+                'status': 'incomplete',
+                'percent': 0,
+            }
+            self.progress_callback(**progress_values)
             try:
                 # TODO make sure this approach works for SBWM download
-                for chunk in r.iter_content(chunk_size=4096):
+                for chunk in r.iter_content(chunk_size=chunk_size):
                     if chunk:
                         handle.write(chunk)
+                        chunk_count += 1
+                        bytes_downloaded += chunk_size
+                    if datetime.now() >= time_update:
+                        time_update = time_updated_last + timedelta(seconds=self.progress_interval_sec)
+                        progress_values['status'] = 'incomplete'
+                        progress_values['bytes_downloaded'] = bytes_downloaded
+                        progress_values['chunk_size'] = chunk_size
+                        progress_values['percent'] = round( ( bytes_downloaded / self.downloader.filesize ) * 100, 2 )
+                        self.progress_callback(**progress_values)
             except requests.exceptions.ChunkedEncodingError as e:
+                progress_values['status'] = 'failed'
+                self.progress_callback(**progress_values)
+                logger.error(e, exc_info=1)
                 raise e
-
-        download_time = time.time() - start_time
+        end_time = time.time()
+        download_time = end_time - start_time
+        progress_values['status'] = 'complete'
+        progress_values['end_time'] = end_time
+        self.progress_callback(**progress_values)
         download_speed = Utils.format_value(
             math.ceil(self.downloader.filesize / (download_time))
         )
-        print(
+        logger.info(
             f"Downloaded {Utils.format_value(self.downloader.filesize, type=FormatTypes.SIZE)} at {download_speed}"
         )
-
-        dl_info = {
-            "outcome": "success",
-            "destination": self.destination,
-            "speed": download_speed,
-            "elapsed": download_time,
-            "cdn": AWSClient.check_cdn(self.original),
-            "concurrency": self.concurrency,
-            "size": self.downloader.filesize,
-            "chunks": 0,
-        }
         if stats:
-            return dl_info
+            return {
+                "outcome": "success",
+                "destination": self.destination,
+                "speed": download_speed,
+                "elapsed": download_time,
+                "cdn": AWSClient.check_cdn(self.original),
+                "concurrency": self.concurrency,
+                "size": self.downloader.filesize,
+                "chunks": chunk_count,
+                "chunk_size": chunk_size,
+            }
         else:
             return self.destination, download_speed
 
@@ -415,34 +437,58 @@ class AWSClient(HTTPClient, object):
                 # Reset new in byte equal to last out byte
                 in_byte = out_byte
 
+            bytes_downloaded = 0
             # Wait on threads to finish
+            progress_values = {
+                'download_type': 'multi_thread',
+                'start_time': start_time,
+                'end_time': None,
+                'status': 'incomplete',
+                'chunks': self.downloader.chunks,
+                'percent': 0,
+            }
             for future in concurrent.futures.as_completed(self.futures):
                 try:
                     chunk_size = future.result()
-                    print(chunk_size)
-                except Exception as exc:
-                    print(exc)
+                    bytes_downloaded += chunk_size
+                    bytes_downloaded_percent = round( ( bytes_downloaded / self.downloader.filesize ) * 100, 2 )
+                    logger.debug(f"This chunk size: {chunk_size}")
+                    progress_values['status'] = 'incomplete'
+                    progress_values['bytes_downloaded'] = bytes_downloaded
+                    progress_values['chunk_size'] = chunk_size
+                    progress_values['percent'] = bytes_downloaded_percent
+                    self.progress_callback(**progress_values)
+                except Exception as e:
+                    progress_values['status'] = 'failed'
+                    logger.error(e, exc_info=1)
+                    self.progress_callback(**progress_values)
 
+        end_time = time.time()
+        # Callback
+        progress_values['status'] = 'complete'
+        progress_values['end_time'] = end_time
+        self.progress_callback(**progress_values)
         # Calculate and print stats
-        download_time = round((time.time() - start_time), 2)
+        download_time = round((end_time - start_time), 2)
         download_speed = round((self.downloader.filesize / download_time), 2)
+        # Log completion event
+        logger.info(
+            f"Downloaded {Utils.format_value(self.downloader.filesize, type=FormatTypes.SIZE)} at {Utils.format_value(download_speed, type=FormatTypes.SPEED)}"
+        )
 
         if self.downloader.checksum_verification == True:
             # Check for checksum, if not present throw error
             if self.downloader._get_checksum() == None:
+                logger.error(f"Checksum could not be verified, not present.")
                 raise AssetChecksumNotPresent
 
             # Calculate the file hash
-            if (
-                Utils.calculate_hash(self.destination)
-                != self.downloader.original_checksum
-            ):
+            logger.debug('Calculating checksum')
+            disk_hash = Utils.calculate_hash(self.destination)
+            asset_hash = self.downloader.original_checksum
+            logger.debug(f"Disk: {disk_hash}; Asset: {asset_hash}")
+            if ( disk_hash != asset_hash ):
                 raise AssetChecksumMismatch
-
-        # Log completion event
-        SDKLogger("downloads").info(
-            f"Downloaded {Utils.format_value(self.downloader.filesize, type=FormatTypes.SIZE)} at {Utils.format_value(download_speed, type=FormatTypes.SPEED)}"
-        )
 
         # Submit telemetry
         transfer_stats = {
@@ -453,10 +499,8 @@ class AWSClient(HTTPClient, object):
 
         # Event(self.user_id, 'python-sdk-download-stats', transfer_stats)
 
-        # If stats = True, we return a dict with way more info, otherwise \
         if self.downloader.stats:
-            # We end by returning a dict with info about the download
-            dl_info = {
+            return {
                 "outcome": "success",
                 "destination": self.destination,
                 "speed": download_speed,
@@ -466,7 +510,6 @@ class AWSClient(HTTPClient, object):
                 "size": self.downloader.filesize,
                 "chunks": self.downloader.chunks,
             }
-            return dl_info
         else:
             return self.destination
 
