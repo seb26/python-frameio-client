@@ -16,7 +16,7 @@ from .exceptions import (
 from .logger import SDKLogger
 from .utils import FormatTypes, Utils
 
-logger = SDKLogger("downloads")
+logger = SDKLogger.getLogger(__name__)
 
 from .bandwidth import DiskBandwidth, NetworkBandwidth
 from .exceptions import (
@@ -228,10 +228,10 @@ class AWSClient(HTTPClient, object):
                 os.remove(self.downloader.destination)  # Remove the file
                 self._create_file_stub()  # Create a new stub
             else:
-                print(e)
+                logger.error(e)
                 raise e
         except TypeError as e:
-            print(e)
+            logger.error(e)
             raise e
         return True
 
@@ -342,7 +342,7 @@ class AWSClient(HTTPClient, object):
                 self.downloader.filesize - (self.bytes_started + chunk_size)
             )  # should be negative
             chunk_size = chunk_size - difference
-            print(f"Chunk size as done via math: {chunk_size}")
+            logger.debug(f"Final chunk will be: {chunk_size}")
         else:
             pass
 
@@ -379,22 +379,22 @@ class AWSClient(HTTPClient, object):
         # After the function completes, we report back the # of bytes transferred
         return chunk_size
 
-    def multi_thread_download(self):
-        start_time = time.time()
-
+    def _multi_thread_download(self):
         # Generate stub
         try:
             self._create_file_stub()
         except Exception as e:
+            logger.error(f"Unable to create file stub")
             raise DownloadException(message=e)
 
         offset = math.ceil(self.downloader.filesize / self.downloader.chunks)
         in_byte = 0  # Set initially here, but then override
 
-        print(
-            f"Multi-part download -- {self.downloader.asset['name']} -- {Utils.format_value(self.downloader.filesize, type=FormatTypes.SIZE)}"
+        logger.info(
+            f"Begin multi-part download -- {self.downloader.asset['name']} -- {Utils.format_value(self.downloader.filesize, type=FormatTypes.SIZE)}"
         )
 
+        start_time = time.time()
         with concurrent.futures.ThreadPoolExecutor(
             max_workers=self.concurrency
         ) as executor:
