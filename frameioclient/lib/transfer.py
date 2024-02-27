@@ -290,16 +290,17 @@ class AWSClient(HTTPClient, object):
         chunk_size = 4096
         bytes_downloaded = 0
         with open(self.downloader.destination, "wb") as handle:
-            time_updated_last = datetime.now()
-            time_update = time_updated_last + timedelta(seconds=self.progress_interval_sec)
-            progress_values = {
-                'download_type': 'whole',
-                'start_time': start_time,
-                'end_time': None,
-                'status': 'incomplete',
-                'percent': 0,
-            }
-            self.progress_callback(**progress_values)
+            if self.progress_callback:
+                time_updated_last = datetime.now()
+                time_update = time_updated_last + timedelta(seconds=self.progress_interval_sec)
+                progress_values = {
+                    'download_type': 'whole',
+                    'start_time': start_time,
+                    'end_time': None,
+                    'status': 'incomplete',
+                    'percent': 0,
+                }
+                self.progress_callback(**progress_values)
             try:
                 # TODO make sure this approach works for SBWM download
                 for chunk in r.iter_content(chunk_size=chunk_size):
@@ -307,23 +308,26 @@ class AWSClient(HTTPClient, object):
                         handle.write(chunk)
                         chunk_count += 1
                         bytes_downloaded += chunk_size
-                    if datetime.now() >= time_update:
-                        time_update = time_updated_last + timedelta(seconds=self.progress_interval_sec)
-                        progress_values['status'] = 'incomplete'
-                        progress_values['bytes_downloaded'] = bytes_downloaded
-                        progress_values['chunk_size'] = chunk_size
-                        progress_values['percent'] = round( ( bytes_downloaded / self.downloader.filesize ) * 100, 2 )
-                        self.progress_callback(**progress_values)
+                    if self.progress_callback:
+                        if datetime.now() >= time_update:
+                            time_update = time_updated_last + timedelta(seconds=self.progress_interval_sec)
+                            progress_values['status'] = 'incomplete'
+                            progress_values['bytes_downloaded'] = bytes_downloaded
+                            progress_values['chunk_size'] = chunk_size
+                            progress_values['percent'] = round( ( bytes_downloaded / self.downloader.filesize ) * 100, 2 )
+                            self.progress_callback(**progress_values)
             except requests.exceptions.ChunkedEncodingError as e:
-                progress_values['status'] = 'failed'
-                self.progress_callback(**progress_values)
                 logger.error(e, exc_info=1)
+                if self.progress_callback:
+                    progress_values['status'] = 'failed'
+                    self.progress_callback(**progress_values)
                 raise e
         end_time = time.time()
         download_time = end_time - start_time
-        progress_values['status'] = 'complete'
-        progress_values['end_time'] = end_time
-        self.progress_callback(**progress_values)
+        if self.progress_callback:
+            progress_values['status'] = 'complete'
+            progress_values['end_time'] = end_time
+            self.progress_callback(**progress_values)
         download_speed = Utils.format_value(
             math.ceil(self.downloader.filesize / (download_time))
         )
@@ -417,6 +421,9 @@ class AWSClient(HTTPClient, object):
         )
 
         start_time = time.time()
+        if self.progress_callback:
+            time_updated_last = datetime.now()
+            time_update = time_updated_last + timedelta(seconds=self.progress_interval_sec)
         with concurrent.futures.ThreadPoolExecutor(
             max_workers=self.concurrency
         ) as executor:
@@ -438,36 +445,43 @@ class AWSClient(HTTPClient, object):
                 in_byte = out_byte
 
             bytes_downloaded = 0
+            if self.progress_callback:
+                # Establish some callback values
+                progress_values = {
+                    'download_type': 'multi_thread',
+                    'start_time': start_time,
+                    'end_time': None,
+                    'status': 'incomplete',
+                    'chunks': self.downloader.chunks,
+                    'percent': 0,
+                }
             # Wait on threads to finish
-            progress_values = {
-                'download_type': 'multi_thread',
-                'start_time': start_time,
-                'end_time': None,
-                'status': 'incomplete',
-                'chunks': self.downloader.chunks,
-                'percent': 0,
-            }
             for future in concurrent.futures.as_completed(self.futures):
                 try:
                     chunk_size = future.result()
                     bytes_downloaded += chunk_size
                     bytes_downloaded_percent = round( ( bytes_downloaded / self.downloader.filesize ) * 100, 2 )
                     logger.debug(f"This chunk size: {chunk_size}")
-                    progress_values['status'] = 'incomplete'
-                    progress_values['bytes_downloaded'] = bytes_downloaded
-                    progress_values['chunk_size'] = chunk_size
-                    progress_values['percent'] = bytes_downloaded_percent
-                    self.progress_callback(**progress_values)
+                    if self.progress_callback:
+                        if datetime.now() >= time_update:
+                            time_update = time_updated_last + timedelta(seconds=self.progress_interval_sec)
+                            progress_values['status'] = 'incomplete'
+                            progress_values['bytes_downloaded'] = bytes_downloaded
+                            progress_values['chunk_size'] = chunk_size
+                            progress_values['percent'] = bytes_downloaded_percent
+                            self.progress_callback(**progress_values)
                 except Exception as e:
                     progress_values['status'] = 'failed'
                     logger.error(e, exc_info=1)
-                    self.progress_callback(**progress_values)
+                    if self.progress_callback:
+                        self.progress_callback(**progress_values)
 
         end_time = time.time()
         # Callback
-        progress_values['status'] = 'complete'
-        progress_values['end_time'] = end_time
-        self.progress_callback(**progress_values)
+        if self.progress_callback:
+            progress_values['status'] = 'complete'
+            progress_values['end_time'] = end_time
+            self.progress_callback(**progress_values)
         # Calculate and print stats
         download_time = round((end_time - start_time), 2)
         download_speed = round((self.downloader.filesize / download_time), 2)
