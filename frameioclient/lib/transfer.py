@@ -288,6 +288,7 @@ class AWSClient(HTTPClient, object):
         self.session = self._get_session()
         r = self.session.get(url, stream=True)
         chunk_size = 4096
+        chunk_count = 0
         bytes_downloaded = 0
         with open(self.downloader.destination, "wb") as handle:
             if self.progress_callback:
@@ -299,6 +300,7 @@ class AWSClient(HTTPClient, object):
                     'end_time': None,
                     'status': 'incomplete',
                     'percent': 0,
+                    'chunk_size': chunk_size,
                 }
                 self.progress_callback(**progress_values)
             try:
@@ -313,7 +315,6 @@ class AWSClient(HTTPClient, object):
                             time_update = time_updated_last + timedelta(seconds=self.progress_interval_sec)
                             progress_values['status'] = 'incomplete'
                             progress_values['bytes_downloaded'] = bytes_downloaded
-                            progress_values['chunk_size'] = chunk_size
                             progress_values['percent'] = round( ( bytes_downloaded / self.downloader.filesize ) * 100, 2 )
                             self.progress_callback(**progress_values)
             except requests.exceptions.ChunkedEncodingError as e:
@@ -452,7 +453,7 @@ class AWSClient(HTTPClient, object):
                     'start_time': start_time,
                     'end_time': None,
                     'status': 'incomplete',
-                    'chunks': self.downloader.chunks,
+                    'chunks_num': self.downloader.chunks,
                     'percent': 0,
                 }
             # Wait on threads to finish
@@ -522,7 +523,7 @@ class AWSClient(HTTPClient, object):
                 "cdn": AWSClient.check_cdn(self.original),
                 "concurrency": self.concurrency,
                 "size": self.downloader.filesize,
-                "chunks": self.downloader.chunks,
+                "chunks_num": self.downloader.chunks,
             }
         else:
             return self.destination
