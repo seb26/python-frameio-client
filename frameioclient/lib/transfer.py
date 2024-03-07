@@ -389,15 +389,6 @@ class AWSClient(HTTPClient, object):
             chunk_size = len(r.content)  # Get the final chunk size
             fp.write(r.content)  # Write the data
 
-        # Save requests logs
-        self.downloader.request_logs.append(
-            {
-                "headers": r.headers,
-                "http_status": r.status_code,
-                "bytes_transferred": len(r.content),
-            }
-        )
-
         # Increase the count for bytes_completed, but only if it doesn't overrun file length
         self.bytes_completed += chunk_size
         if self.bytes_completed > self.downloader.filesize:
@@ -505,14 +496,6 @@ class AWSClient(HTTPClient, object):
             if ( disk_hash != asset_hash ):
                 raise AssetChecksumMismatch
 
-        # Submit telemetry
-        transfer_stats = {
-            "speed": download_speed,
-            "time": download_time,
-            "cdn": AWSClient.check_cdn(self.original),
-        }
-
-        # Event(self.user_id, 'python-sdk-download-stats', transfer_stats)
 
         if self.downloader.stats:
             return {
