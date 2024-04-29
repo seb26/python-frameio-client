@@ -1,41 +1,37 @@
+from .bandwidth import DiskBandwidth, NetworkBandwidth
+from .exceptions import (
+    AssetChecksumMismatch,
+    AssetChecksumNotPresent,
+    AssetNotFullyUploaded,
+    DownloadException,
+    WatermarkIDDownloadException,
+)
+from .logger import SDKLogger
+from .transport import HTTPClient
+from .utils import FormatTypes, Utils
+
 import concurrent.futures
 import math
 import os
 import time
 from datetime import datetime, timedelta
-from pprint import pprint
 from random import randint
 from typing import Any, Callable, Dict, List, Optional
 
 import requests
-
-from .exceptions import (
-    AssetChecksumMismatch,
-    AssetChecksumNotPresent,
-    DownloadException,
-)
-from .logger import SDKLogger
-from .utils import FormatTypes, Utils
+from send2trash import send2trash
 
 logger = SDKLogger.getLogger(__name__)
-
-from .bandwidth import DiskBandwidth, NetworkBandwidth
-from .exceptions import (
-    AssetNotFullyUploaded,
-    DownloadException,
-    WatermarkIDDownloadException,
-)
-from .transport import HTTPClient
-
 
 class FrameioDownloader(object):
     def __init__(
         self,
         asset: Dict,
         download_folder: str,
-        prefix: str,
+        prefix: str = None,
         multi_part: bool = False,
         replace: bool = False,
+        use_temp_filename: bool = False,
     ):
         self.multi_part = multi_part
         self.asset = asset
@@ -44,12 +40,15 @@ class FrameioDownloader(object):
         self.replace = replace
         self.resolution_map = dict()
         self.destination = None
+        self.destination_temp = None
+        self.use_temp_filename = use_temp_filename
         self.watermarked = asset["is_session_watermarked"]  # Default is probably false
         self.filesize = asset["filesize"]
         self.futures = list()
         self.checksum = None
         self.original_checksum = None
         self.checksum_verification = True
+        self.checksum_strict = False
         self.chunk_size = 25 * 1024 * 1024  # 25 MB chunk size
         self.chunks = math.ceil(self.filesize / self.chunk_size)
         self.prefix = prefix
@@ -82,13 +81,13 @@ class FrameioDownloader(object):
             self.original_checksum = None
 
     def _get_path(self):
-        if self.prefix != None:
+        if self.prefix:
             self.filename = self.prefix + self.filename
-
-        if self.destination == None:
-            final_destination = os.path.join(self.download_folder, self.filename)
-            self.destination = final_destination
-
+        if self.destination is None:
+            self.destination = os.path.join(self.download_folder, self.filename)
+        if self.use_temp_filename:
+            # Example: filename.mp4.tmp-8fa26e04
+            self.destination_temp = os.path.join(self.destination, '.tmp-' + self.asset['id'][:8])
         return self.destination
 
     def _get_checksum(self):
@@ -96,8 +95,42 @@ class FrameioDownloader(object):
             self.original_checksum = self.asset["checksums"]["xx_hash"]
         except (TypeError, KeyError):
             self.original_checksum = None
-
         return self.original_checksum
+    
+    def _checksum_verify(self, filepath: str):
+        file_was_checksum_verified = False
+        if self.downloader.checksum_verification is True:
+            # Check for checksum, if not present throw error
+            asset_sum = self.downloader._get_checksum()
+            if asset_sum is None:
+                logger.error(f"Checksum could not be verified, no xxhash checksum was listed.")
+                if self.checksum_strict:
+                    raise AssetChecksumNotPresent
+                else:
+                    return False
+            # Calculate the file hash
+            logger.debug('Calculating checksum...')
+            disk_sum = Utils.calculate_hash(filepath)
+            logger.debug(f"Asset: {asset_sum}; Disk {disk_sum}")
+            if ( asset_sum == disk_sum ):
+                file_was_checksum_verified = True
+            else:
+                if self.checksum_strict:
+                    raise AssetChecksumMismatch
+                else:
+                    return False
+        else:
+            return False
+
+    def _rename_from_temp_file(self):
+        try:
+            os.rename(
+                self.destination_temp,
+                self.destination
+            )
+        except Exception as e:
+            logger.error(f"Unable to rename the temp file contents to the correct filename, see exception: {e}")
+            logger.debug(e, exc_info=1)
 
     def get_download_key(self):
         try:
@@ -129,7 +162,11 @@ class FrameioDownloader(object):
 
         return url
 
-    def download(self, stats=False, progress_callback: Callable[[str], Any]=None):
+    def download(
+            self,
+            stats: bool = False,
+            progress_callback: Callable[[str], Any] = None,
+        ):
         """Call this to perform the actual download of your asset!
 
         - stats: True to return a dict with stats about the download.
@@ -137,49 +174,78 @@ class FrameioDownloader(object):
 
         # Check folders
         if not os.path.isdir(os.path.join(os.path.curdir, self.download_folder)):
-            logger.debug("Destination folder not found, creating")
             os.mkdir(self.download_folder)
 
         # Check files
         filepath = self._get_path()
-        if not os.path.isfile(filepath):
-            pass
-
-        if os.path.isfile(filepath) and self.replace:
-            logger.info("File already exists at this location. replace=True so it will be deleted on disk and redownloaded.")
-            os.remove(filepath)
-
-        if os.path.isfile(filepath) and not self.replace:
-            if self.checksum_verification:
-                # Unimplemented
-                # Do a checksum verification against disk file and determine if file is faulty and requires redownload
-                pass
+        if os.path.isfile(filepath):
             filesize_on_disk = os.path.getsize(filepath)
-            if self.filesize == filesize_on_disk:
-                logger.info("File already exists at this location with same filesize. Skipping download.")
-                if stats:
+            if self.checksum_verification:
+                result = self._checksum_verify(filepath)
+                if result is True:
+                    logger.info("File already exists at this location, and checksum matches. Skipping download.")
+                else:
+                    if self.replace is True:
+                        logger.warning("File already exists at this location, and checksum does not match. `replace=True`, so it will be deleted on disk and redownloaded.")
+                        logger.warning(f"Filesize on Frame.io: {self.filesize}; On disk: {filesize_on_disk}")
+                        send2trash(filepath)
+                        return {
+                            "outcome_code": 0,
+                            "outcome_file_exists": True,
+                            "outcome_filesize_matched": None,
+                            "outcome_checksum_matched": False,
+                        }
+                    else:
+                        logger.warning("File already exists at this location, and checksum does not match. `replace=False`, so it will be skipped without action.")
+                        return {
+                            "outcome_code": 1,
+                            "outcome_file_exists": True,
+                            "outcome_filesize_matched": None,
+                            "outcome_checksum_matched": False,
+                        }
+            else:
+                if self.filesize == filesize_on_disk:
+                    logger.info("File already exists at this location, matches filesize, no checksum available. Skipping download.")
                     return {
-                        "outcome": "file_exists_already_on_disk",
-                        "destination": self.destination,
+                        "outcome_code": 1,
+                        "outcome_file_exists": True,
+                        "outcome_filesize_matched": True,
+                        "outcome_checksum_matched": False,
                     }
                 else:
-                    return self.destination
-            else:
-                logger.info(f"""File already exists at this location on disk, and filesize is different to the asset size on Frame.IO. Will redownload (overwrite).
-                    (asset size: {self.filesize}, size on disk: {filesize_on_disk})""")
+                    if self.replace is True:
+                        logger.warning("File already exists at this location, and filesize does not match. `replace=True`, so it will be deleted on disk and redownloaded.")
+                        return {
+                            "outcome_code": 0,
+                            "outcome_file_exists": True,
+                            "outcome_filesize_matched": False,
+                            "outcome_checksum_matched": False,
+                        }
+                    else:
+                        logger.warning("File already exists at this location, and filesize does not match. `replace=False`, so it will be skipped without action.")
+                        return {
+                            "outcome_code": 1,
+                            "outcome_file_exists": True,
+                            "outcome_filesize_matched": False,
+                            "outcome_checksum_matched": False,
+                        }
 
         # Get URL
         url = self.get_download_key()
 
         # AWS Client
-        self.aws_client = AWSClient(downloader=self, concurrency=5, progress_callback=progress_callback)
+        self.aws_client = AWSClient(
+            concurrency = 5,
+            downloader = self,
+            progress_callback = progress_callback,
+        )
 
         # Handle watermarking
         if self.watermarked == True:
             return self.aws_client._download_whole(url)
 
         else:
-            # Don't use multi-part download for files below 25 MB
+            # Use multi-part download only for files greater than 25 MB
             if self.asset["filesize"] < 26214400:
                 return self.aws_client._download_whole(url, stats)
             if self.multi_part == True:
@@ -189,7 +255,12 @@ class FrameioDownloader(object):
 
 
 class AWSClient(HTTPClient, object):
-    def __init__(self, downloader: FrameioDownloader, concurrency=None, progress_callback=None):
+    def __init__(
+        self,
+        downloader: FrameioDownloader,
+        concurrency = None,
+        progress_callback: Callable[[str], Any] = None,
+    ):
         super().__init__(self)  # Initialize via inheritance
         self.progress_callback = progress_callback
         self.progress_interval_sec = 5
@@ -290,7 +361,11 @@ class AWSClient(HTTPClient, object):
         chunk_size = 4096
         chunk_count = 0
         bytes_downloaded = 0
-        with open(self.downloader.destination, "wb") as handle:
+        if self.downloader.use_temp_filename:
+            filepath = self.downloader.destination_temp
+        else:
+            filepath = self.downloader.destination
+        with open(filepath, "wb") as handle:
             if self.progress_callback:
                 time_updated_last = datetime.now()
                 time_update = time_updated_last + timedelta(seconds=self.progress_interval_sec)
@@ -324,6 +399,8 @@ class AWSClient(HTTPClient, object):
                     self.progress_callback(**progress_values)
                 raise e
         end_time = time.time()
+        if self.downloader.use_temp_filename:
+            self.downloader._rename_from_temp_file()
         download_time = end_time - start_time
         if self.progress_callback:
             progress_values['status'] = 'complete'
@@ -335,9 +412,16 @@ class AWSClient(HTTPClient, object):
         logger.info(
             f"Downloaded {Utils.format_value(self.downloader.filesize, type=FormatTypes.SIZE)} at {download_speed}"
         )
+        # Checksum verification
+        if self.downloader.checksum_verification is True:
+            file_was_checksum_verified = self._checksum_verify(self.destination)
+        else:
+            file_was_checksum_verified = False
         if stats:
             return {
-                "outcome": "success",
+                "outcome_code": 0,
+                "outcome_description": "completed",
+                "verification": file_was_checksum_verified,
                 "destination": self.destination,
                 "speed": download_speed,
                 "elapsed": download_time,
@@ -467,8 +551,9 @@ class AWSClient(HTTPClient, object):
                     logger.error(e, exc_info=1)
                     if self.progress_callback:
                         self.progress_callback(**progress_values)
-
         end_time = time.time()
+        if self.downloader.use_temp_filename:
+            self.downloader._rename_from_temp_file()
         # Callback
         if self.progress_callback:
             progress_values['status'] = 'complete'
@@ -481,25 +566,16 @@ class AWSClient(HTTPClient, object):
         logger.info(
             f"Downloaded {Utils.format_value(self.downloader.filesize, type=FormatTypes.SIZE)} at {Utils.format_value(download_speed, type=FormatTypes.SPEED)}"
         )
-
-        if self.downloader.checksum_verification == True:
-            # Check for checksum, if not present throw error
-            if self.downloader._get_checksum() == None:
-                logger.error(f"Checksum could not be verified, not present.")
-                raise AssetChecksumNotPresent
-
-            # Calculate the file hash
-            logger.debug('Calculating checksum')
-            disk_hash = Utils.calculate_hash(self.destination)
-            asset_hash = self.downloader.original_checksum
-            logger.debug(f"Disk: {disk_hash}; Asset: {asset_hash}")
-            if ( disk_hash != asset_hash ):
-                raise AssetChecksumMismatch
-
-
+        # Checksum verification
+        if self.downloader.checksum_verification is True:
+            file_was_checksum_verified = self._checksum_verify(self.destination)
+        else:
+            file_was_checksum_verified = False
         if self.downloader.stats:
             return {
-                "outcome": "success",
+                "status_code": 0,
+                "status_description": "completed",
+                "verified": file_was_checksum_verified,
                 "destination": self.destination,
                 "speed": download_speed,
                 "elapsed": download_time,
