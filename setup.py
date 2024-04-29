@@ -4,7 +4,7 @@ import setuptools
 
 from setuptools.command.install import install
 
-version='2.0.0'
+version='2.0.1'
 
 with open("README.md", "r") as f:
   long_description = f.read()
@@ -30,6 +30,7 @@ setuptools.setup(
     'importlib-metadata ~= 1.0 ; python_version < "3.8"',
     'requests',
     'token-bucket',
+    'send2trash',
     'speedtest-cli',
     'urllib3',
     'xxhash',
