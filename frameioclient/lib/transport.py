@@ -13,6 +13,9 @@ from .exceptions import PresentationException
 from .utils import PaginatedResponse
 from .version import ClientVersion
 
+import logging
+
+logger = logging.getLogger(__name__)
 
 class HTTPMethods:
     GET = "get"
@@ -112,6 +115,8 @@ class APIClient(HTTPClient, object):
             method, self._format_api_call(endpoint), headers=headers, json=payload
         )
 
+        logger.debug(f"API URL: {r.url}")
+
         if r.ok:
             if r.headers.get("page-number"):
                 if int(r.headers.get("total-pages")) > 1:
@@ -129,7 +134,7 @@ class APIClient(HTTPClient, object):
 
             if isinstance(r.json(), list):
                 return r.json()[:limit]
-
+            
             return r.json()
 
         if r.status_code == 422 and "presentation" in endpoint:

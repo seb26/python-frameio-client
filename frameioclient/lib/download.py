@@ -9,6 +9,12 @@ from .transfer import AWSClient
 
 # from .telemetry import Event, ComparisonTest
 
+
+"""
+DEPRECATED!!!
+"""
+
+
 logger = SDKLogger("downloads")
 
 from .exceptions import (
